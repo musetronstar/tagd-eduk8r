@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+ <meta charset="utf-8">
+ <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=yes">
+ <title>Python Tutorial</title>
+ <link href="/styles/style.css" rel="stylesheet">
+<link rel="stylesheet" href="//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.15.10/styles/darcula.min.css">
+<script src="//cdnjs.cloudflare.com/ajax/libs/highlight.js/9.15.10/highlight.min.js"></script>
+<script>hljs.initHighlightingOnLoad();</script>
+</head>
+<body>
+	<h1>
+		<a href="/"><img id="logo" src="/logo.png"></a>Resources
+	</h1>
+ <hr>
+<!-- START CONTENT -->
+
+<h2>Hints for Assignment 2</h2>
+
+<p>First, insert the error function at the top of the program, under your program description comment.</p>
+
+<pre lang="python"><code>import sys
+
+# prints error string and quits the program with an exit code
+def error(str):
+    print(str, file=sys.stderr)
+    sys.exit(1)
+</code></pre>
+
+<p>You will need to check string lengths and do splicing.</p>
+
+<pre lang="python"><code>name = &quot;Johnny&quot;
+print(len(name))
+#&gt; 6
+
+# truncate name to length 4
+print(name[0:4])
+#&gt; John
+</code></pre>
+
+<p>You will need to define functions - some that return values,<br>
+some that do not return values.</p>
+
+<pre lang="python"><code># accepts a number and *returns* a string whether its big or small
+def num_big_small(n):
+    if n &gt;= 100:
+        return &quot;big&quot;
+    else:
+        return &quot;small&quot;
+
+# prints whether a number is big or small - *does not return* a value
+def print_big_small(n):
+    print(&quot;{} is a {} number&quot;.format(n, num_big_small(n)))
+
+# call the function, passing it a value
+print_big_small(13)
+#&gt; 13 is a small number
+</code></pre>
+
+<p>Read the <a href="http://eduk8.us/%7Eict/resources/python/tutorial/02-string-variables.html">strings tutorial</a> for more information about string manipulation.</p>
+
+<!-- END CONTENT -->
+</body>
+</html>

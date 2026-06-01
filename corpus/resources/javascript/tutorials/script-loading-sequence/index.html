@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=yes">
+	<title>Script Loading Sequence</title>
+	<script>
+		function logSequence(id) {
+			console.log("sequence: " + id);
+			let elem = document.getElementById(id);
+			if (elem)
+				elem.textContent += " => Done";
+			else
+				console.error("undefined element id: " + id);
+		}
+
+		window.addEventListener('DOMContentLoaded', (ev) => {
+			logSequence('dom-content-loaded');
+		});
+
+		logSequence('inline-before');
+	</script>
+	<script src="async-defer.js" async defer></script>
+</head>
+<body>
+	<h1>Script Loading Sequence</h1>
+	<p>Enable your JavaScript console (press <em>F12</em>) to see the sequence of the JavaScript executed.</p>
+	<h2 id="inline-before">Inline Script Before</h2>
+	<h2 id="inline-after">Inline Script After</h2>
+	<h2 id="async-defer">Asynchronous Defered Script</h2>
+	<h2 id="dom-content-loaded">DOMContentLoaded Event</h2>
+
+	<script>
+		logSequence('inline-after');
+	</script>
+</body>
+</html>
