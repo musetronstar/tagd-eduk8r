@@ -1,0 +1,6 @@
+# python dunders
+__*
+
+# hidden files/dirs
+.*
+!.gitignore

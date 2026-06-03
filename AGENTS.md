@@ -29,13 +29,18 @@ This single rule applies strictly to:
 
 ## Constraints
 
-### 1. File Handling & Isolation
+### File Handling & Isolation
 
 * Keep `app/` and `corpus/` strictly separated.
 * Do not alter human-authored educational prose or code examples unless explicitly tasked.
 * Ensure all test suites use isolated test fixtures. Never allow tests to write temporary files or dummy directories directly into the production `corpus/` path.
 
-### 2. Workflow & Deliverables
+### Comments
+
+* **self-documenting code preferred**, but REQUIRED: add concise **intent comments** (**why** not "what")
+* Comment the invariant or reason the code is shaped this way; do not restate mechanics or narrate the current task
+
+### Workflow & Deliverables
 
 1. **Acknowledge:** Restate the requested change in concrete terms before editing.
 2. **Implement:** Make the smallest, most reviewable change that satisfies the task criteria.
