@@ -1,0 +1,49 @@
+-*
+ * tagd-eduk8r bootstrap
+ *
+ * Prerequisite tags for representing an educational corpus,
+ * Google Classroom archives, assignments, resources, rubrics,
+ * and course metadata as TAGL.
+ *-
+
+>> corpus _sub _entity;
+>> educational_corpus _sub corpus;
+
+>> course _sub _entity;
+>> courses plural_of course;
+
+>> assignment _sub _entity;
+>> assignments plural_of assignment;
+
+>> assignment_type _sub category;
+>> topic _sub concept;
+
+>> resource _sub _entity;
+>> resources plural_of resource;
+
+>> rubric _sub _entity;
+>> rubrics plural_of rubric;
+
+>> attachment _sub _entity;
+>> attachments plural_of attachment;
+
+>> classroom _sub _entity;
+>> google_classroom _sub classroom;
+
+>> contains _type_of _rel;
+>> assigned_in _type_of _rel;
+>> belongs_to _type_of _rel;
+>> categorized_as _type_of _rel;
+>> tagged_with _type_of _rel;
+>> has_resource _type_of _rel;
+>> has_attachment _type_of _rel;
+>> has_rubric _type_of _rel;
+>> archived_from _type_of _rel;
+>> exported_to _type_of _rel;
+
+>> markdown_file _sub file;
+>> csv_file _sub file;
+>> tagl_file _sub file;
+>> html_file _sub file;
+>> python_file _sub file;
+
