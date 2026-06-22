@@ -5,11 +5,14 @@ a corpus of educational content. This is a design document for that corpus.
 
 ## Terms
 
++ **asset**: an educational entity (e.g. assignment, course, resource, file, etc) which exists as a subject of TAGL statement
 + **assignment**: an assigned work item as part of a progression through a course
-+ **assignment_type**: a single (one-and-only-one) category that an assignment falls under. Google Classroom calls these topics, but a a tagd-eduk8r topic will be different (an assignment will have 0 or many topics associated)
-+ **topic**: a relation from an assignment to a specific topic tag - one assignment can have zero or many topics (`relators` horizontal relations, not `super_relators` which have one and only one subordinate relation)
-+ **courses**: and educational course name
-+ 
++ **assignment_type**: a single (one-and-only-one) category that an assignment falls under.
+  Google Classroom calls these topics, but a a tagd-eduk8r topic will be different (an assignment will have 0 or many topics associated).
+  My Google classroom assignments typically fall into one of this set of topics: Classwork, Participation, Assessments, Resources, Extra Credit
++ **topic**: a relation (object in a TAGL statement) from an asset to a specific topic tag.
+  One assignment can have zero or many topics (`relators` horizontal relations, not `super_relators` which have one and only one subordinate relation)
++ **courses**: an educational course name
 
 ## Corpus Organization
 We want a well organized local corpus of:
@@ -17,16 +20,16 @@ We want a well organized local corpus of:
 * Courses (course directories contain assignment subdirectories):
 * Assignments (each assigment should have its own directory of):
   + directory path either in the form (let's use Socratic reasoning to decide):
-    1. `<slugified-classroom-course>/<slugified-classroom-topic>/<slugified-assignment-title>/`
+    1. `<slugified-google-classroom-course>/<slugified-google-classroom-topic>/<slugified-assignment-title>/`
       or
-    2. `<slugified-classroom-course>/<slugified-assignment-title>/`
+    2. `<slugified-google-classroom-course>/<slugified-assignment-title>/`
   + `<slugified-assignment-title>-assignment.md`
   + file attachments (original file name)
   + rubrics as `<slugified-assignment-title>-rubric.csv`
   + rubrics as `<slugified-assignment-title>-meta.tagl`
     containing
 ```tagl
-
+-- TAGL statements using prerequisites defined in the bootstrap file
 ```
 
 ## Current Corpus Directory Structure
