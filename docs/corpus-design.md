@@ -40,7 +40,7 @@ The corpus is recursively self-similar.
 
 Every educational asset follows the same structural rules regardless of depth within the corpus.
 
-Large educational collections are therefore composed from the same simple building blocks as individual lessons or assignments.
+Large educational collections are therefore composed from the same simple building blocks whether they be courses, lessons, assignments, rubrics, etc.
 
 ---
 
@@ -52,9 +52,9 @@ Whenever possible:
 
 * prefer universal rules over special cases
 * prefer conventions over configuration
-* prefer topology over metadata
+* prefer tagspace topology over metadata
 
-Additional semantics may always be introduced through TAGL without increasing filesystem complexity.
+Additional semantics can be introduced through `meta.tagl` files without increasing filesystem complexity.
 
 ---
 
@@ -68,89 +68,72 @@ It is the authoritative source from which semantic knowledge is generated.
 
 ---
 
-## File Asset
+## Corpus Asset
 
-A **file asset** is any file or directory contained within the corpus.
+A **corpus asset** is any filesystem object (file or directory) contained within the corpus.
 
 Every file asset has a canonical path relative to the corpus root.
 
 ---
 
-## `eduk8r:asset`
+## Assets and `eduk8r:` prefix
 
-An **`eduk8r:asset`** is a semantic entity represented as the subject of one or more TAGL statements.
-
-An `eduk8r:asset` is generated from one or more related file assets within the corpus.
-
-Examples include:
-
-* course
-* lesson
-* tutorial
-* assignment
-* resource
-* document
-* image
-* source code
-* video
+Every educational asset is represented in the generated tagspace
+by a tag whose identifier begins with the `eduk8r:` namespace.
 
 ---
 
 ## Asset Identity
 
-The identity of an asset is determined by its containment hierarchy within the corpus.
+A directory containing `index.md` represents an educational asset.
 
-A generated tag identifier should therefore preserve the asset's canonical location.
+The generator recursively traverses the corpus searching for `index.md` files.
+
+For each `index.md` encountered, the generator constructs a canonical asset identifier from:
+
+1. the directory path relative to the corpus root; and
+2. the first level-one heading in `index.md`.
 
 For example:
 
+```text
+corpus/
+└── courses/
+    └── intro-to-python/
+        └── assignments/
+            └── personal-data/
+                └── index.md
 ```
-eduk8r:courses:python:tutorials:introduction
-```
-
-represents the educational entity located within the corresponding corpus hierarchy.
-
----
-
-## `index.md`
-
-`index.md` is the canonical human-readable representation of an educational asset.
-
-Every asset directory shall contain an `index.md`.
-
-The minimum valid form is:
 
 ```markdown
-# Title
+# Personal Data
 ```
 
-The first non-blank line shall be exactly one level-one heading.
+may generate:
 
-Additional Markdown content is optional.
+```tagl
+>> eduk8r:courses:Introduction_to_Python:Personal_Data;
+```
 
----
+The directory hierarchy provides structural identity.
 
-## `meta.tagl`
+The level-one heading provides the human-readable component of that identity.
 
-`meta.tagl` is optional.
+All remaining Markdown content is unrestricted.
 
-It provides semantic enrichment, customization, or overrides which cannot be inferred from the corpus topology alone.
-
-`meta.tagl` never establishes the existence of an asset.
-
-Only `index.md` establishes asset identity.
+A directory may optionally contain `meta.tagl`, whose semantic extensions or overrides are applied after the asset identity has been established.
 
 ---
 
 ## Generator
 
-A generator traverses the corpus and produces TAGL describing the educational assets discovered within it.
+A generator traverses the corpus and produces TAGL UTF-8 text describing the educational assets discovered within it.
 
-The generated tagspace is a semantic projection of the corpus.
+The generated tagspace is the TAGL **map** of the corpus **territory**.
 
 ---
 
-# Corpus Axioms
+# Corpus Constraints
 
 The following statements are always true.
 
@@ -166,82 +149,42 @@ The following statements are always true.
 
 6. `index.md` provides the canonical human-readable representation of an asset.
 
-7. `meta.tagl` is optional semantic enrichment.
+7. `meta.tagl` provide optional semantic extensions or overrides.
 
 8. The generated tagspace preserves the containment hierarchy of the corpus.
 
 ---
 
-# Canonical Organization
-
-A minimal corpus may be organized as follows.
+# Corpus Organization Example
 
 ```text
 corpus/
 ├── courses/
 │   ├── index.md
-│   └── python/
+│   └── intro-to-python/
 │       ├── index.md
-│       ├── tutorials/
-│       │   ├── index.md
-│       │   └── introduction/
-│       │       ├── index.md
-│       │       ├── meta.tagl
-│       │       └── files/
-│       │           ├── hello.py
-│       │           └── slides.pdf
 │       └── assignments/
-│           ├── index.md
 │           └── personal-data/
-│               ├── index.md
-│               └── files/
+│               └── index.md
+├── tutorials/
+│   ├── index.md
+│   └── hellow-world/
+│       ├── index.md
+│       ├── meta.tagl
+│       └── files/
+│           ├── hello.py
+│           └── slides.pdf
 └── resources/
     ├── index.md
-    └── python/
-        ├── index.md
-        └── tutorials/
-            ├── index.md
-            └── files/
+    └── python-input-output/
+        └── index.md
 ```
 
 The names of directories are significant because they contribute to the identity of the generated semantic entities.
 
----
-
-# Generated Identity
-
-The generator derives semantic identity from the corpus hierarchy.
-
-Conceptually:
-
-```
-corpus/
-    courses/
-        python/
-            tutorials/
-                introduction/
-```
-
-becomes:
-
-```tagl
->> eduk8r:courses:python:tutorials:introduction
-    type_of eduk8r:tutorial;
-```
-
-Additional semantic relationships may be generated from the containment hierarchy.
-
-For example:
-
-```tagl
->> eduk8r:courses:python:tutorials
-    _sub eduk8r:courses:python;
-
->> eduk8r:courses:python:tutorials:introduction
-    _sub eduk8r:courses:python:tutorials;
-```
-
-The resulting tagspace preserves the topology of the corpus.
+Notice, for example, that the assignment "Personal Data" in the course "Introduction to Python" can have
+**horizontal relations** to tutorials and resources, but not exclusively, as these same tutorials and resources
+could also be used in other courses, or assignments.  Corpus assets are composable building blocks.
 
 ---
 
@@ -260,5 +203,5 @@ Future generators may derive additional semantic information from:
 
 without requiring changes to the corpus model itself.
 
-The simplicity of the corpus is its greatest strength.
+The strength of the corpus is its small set of simple and composable constraints.
 
