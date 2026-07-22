@@ -6,10 +6,11 @@ Guidance for coding agents working in the `tagd-eduk8r` repository.
 
 `tagd-eduk8r` separates application behavior from educational source material:
 
+
 ```
 tagd-eduk8r/
-  app/     # httagd web application code
-  corpus/  # Human-authored educational corpus files (Markdown, code, etc.)
+app/     # httagd web application code
+corpus/  # Human-authored educational corpus files (Markdown, code, etc.)
 ```
 
 Markdown is the default prose format for educational content. TAGL is used exclusively to define the semantic tagspace and data model.
@@ -39,6 +40,12 @@ This single rule applies strictly to:
 
 * **self-documenting code preferred**, but REQUIRED: add concise **intent comments** (**why** not "what")
 * Comment the invariant or reason the code is shaped this way; do not restate mechanics or narrate the current task
+
+### Fail-Fast Error Policy
+* The `classroom-archiver.py` script must adhere to a strict fail-fast execution contract.
+* If the script encounters an unhandled Google Form question type, an unsupported Google Drive attachment/mime type, or an unmapped Classroom entity, it must **immediately terminate with a non-zero exit code** and raise/print a descriptive error message.
+* Error messages must state the exact unhandled object type, name, and parent asset ID to inform task creation for feature gaps.
+* Silent degradation, skipping unhandled fields, or producing partial archives without explicit failure is strictly prohibited.
 
 ### Workflow & Deliverables
 

@@ -14,10 +14,13 @@ import argparse
 import json
 import os
 import re
+import shutil
+import tempfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+from urllib.parse import urlparse
 
 
 # --- Configuration & Paths ---
@@ -26,10 +29,46 @@ REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CORPUS_ROOT = REPO_ROOT / "corpus"
 GOOGLE_API_SCOPES = [
     "https://www.googleapis.com/auth/classroom.courses.readonly",
+    "https://www.googleapis.com/auth/classroom.coursework.students.readonly",
     "https://www.googleapis.com/auth/classroom.courseworkmaterials.readonly",
     "https://www.googleapis.com/auth/classroom.student-submissions.me.readonly",
     "https://www.googleapis.com/auth/drive.readonly",
 ]
+ENTRY_TYPE_DIRECTORIES = {
+    "ASSIGNMENT": "assignments",
+    "QUIZ_ASSIGNMENT": "assessments",
+    "QUESTION": "questions",
+    "SHORT_ANSWER_QUESTION": "questions",
+    "MULTIPLE_CHOICE_QUESTION": "questions",
+    "MATERIAL": "resources",
+}
+SUPPORTED_WORK_TYPES = frozenset(ENTRY_TYPE_DIRECTORIES)
+SUPPORTED_FORM_ITEM_TYPES = frozenset(
+    {
+        "MULTIPLE_CHOICE",
+        "PARAGRAPH",
+        "SHORT_ANSWER",
+        "CHECKBOXES",
+        "DROPDOWN",
+        "MULTIPLE_CHOICE_GRID",
+    }
+)
+SUPPORTED_MIME_TYPES = frozenset(
+    {
+        "application/vnd.google-apps.document",
+        "application/vnd.google-apps.spreadsheet",
+        "application/vnd.google-apps.presentation",
+        "application/pdf",
+        "application/zip",
+        "application/x-zip-compressed",
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/svg+xml",
+        "text/plain",
+        "text/csv",
+    }
+)
 
 
 # --- Data Models ---
@@ -38,6 +77,31 @@ def slugify(value: str) -> str:
     """Return a clean token suitable for selecting a Classroom course."""
     slug = re.sub(r"[^a-z0-9]+", "-", value.strip().lower())
     return slug.strip("-")
+
+
+def parse_archive_token(token: str) -> str:
+    """Extract the Classroom ID from an archive token or bare ID."""
+    return token.split("-", 1)[0]
+
+
+def sanitize_filename(name: str) -> str:
+    """Return an attachment filename that cannot escape its target directory."""
+    sanitized = re.sub(r'[/\\:?*<>|\"]', "-", name).strip().lstrip("- ")
+    if not sanitized:
+        raise RuntimeError(
+            f"Attachment filename is empty after sanitization: {name!r}. "
+            "Halting execution."
+        )
+    return sanitized
+
+
+def validate_form_item_type(item_type: str, form_id: str) -> None:
+    """Reject form structures that the serializer cannot preserve losslessly."""
+    if item_type not in SUPPORTED_FORM_ITEM_TYPES:
+        raise RuntimeError(
+            f"Unsupported Google Form question type: [{item_type}] "
+            f"in form '{form_id}'. Halting execution."
+        )
 
 
 @dataclass
@@ -59,6 +123,12 @@ class Assignment:
     description: str | None = None
     materials: list[ClassroomResource] = field(default_factory=list)
     slug: str = ""
+    creation_time: str = ""
+    max_points: Optional[float] = None
+    due_time: Optional[str] = None
+    work_type: str = "ASSIGNMENT"
+    topic: str | None = None
+    rubric: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if not self.slug:
@@ -164,6 +234,100 @@ class SkeletonCorpusWriter(CorpusWriter):
         self.written_assignments.append((course, assignment))
 
 
+class MarkdownCorpusWriter(CorpusWriter):
+    """Writes classroom content as clean Markdown under corpus/courses/."""
+
+    def write_course(self, course: Course) -> None:
+        destination = self.target_root / "courses" / course.slug
+        if destination.exists():
+            raise RuntimeError(f"Course directory already exists: {destination}")
+
+        # Staging keeps an interrupted course from becoming part of the corpus.
+        with tempfile.TemporaryDirectory(prefix=f"tagd-archive-{course.id}-") as temp_dir:
+            staging_writer = MarkdownCorpusWriter(Path(temp_dir))
+            staging_writer.write_course_structure(course)
+            for assignment in course.assignments:
+                staging_writer.write_assignment_structure(course, assignment)
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if destination.exists():
+                raise RuntimeError(f"Course directory already exists: {destination}")
+            shutil.move(str(Path(temp_dir) / "courses" / course.slug), destination)
+
+    def write_course_structure(self, course: Course) -> None:
+        course_dir = self.target_root / "courses" / course.slug
+        course_dir.mkdir(parents=True, exist_ok=True)
+        lines = [f"# {course.name}"]
+        if course.description:
+            lines.extend(["", course.description])
+        (course_dir / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def write_assignment_structure(self, course: Course, assignment: Assignment) -> None:
+        assignment_dir_name = self._assignment_dir_name(assignment)
+        try:
+            type_subdirectory = ENTRY_TYPE_DIRECTORIES[assignment.work_type]
+        except KeyError as exc:
+            # Reject unknown taxonomy rather than placing content in a misleading collection.
+            raise RuntimeError(f"Unsupported Classroom work type: {assignment.work_type}") from exc
+        assignment_dir = (
+            self.target_root
+            / "courses"
+            / course.slug
+            / type_subdirectory
+            / assignment_dir_name
+        )
+        assignment_dir.mkdir(parents=True, exist_ok=True)
+        lines = [f"# {assignment.title}"]
+        if assignment.description:
+            lines.extend(["", assignment.description])
+        link_materials = [
+            material
+            for material in assignment.materials
+            if material.source_type in {"link", "youtubeVideo"}
+        ]
+        file_materials = [
+            material
+            for material in assignment.materials
+            if material.source_type not in {"link", "youtubeVideo"}
+        ]
+        if link_materials:
+            lines.extend(["", "## Links", ""])
+            for material in link_materials:
+                youtube_suffix = " (YouTube)" if material.source_type == "youtubeVideo" else ""
+                lines.append(
+                    f"* [{material.title}]({material.source_url}){youtube_suffix}"
+                )
+        if file_materials:
+            lines.extend(["", "## Materials", ""])
+            for material in file_materials:
+                lines.append(f"* [{material.title}]({material.source_url})")
+        detail_lines = self._assignment_detail_lines(assignment)
+        if detail_lines:
+            lines.extend(["", "## Assignment Details", *detail_lines])
+        (assignment_dir / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _assignment_dir_name(self, assignment: Assignment) -> str:
+        creation_date = assignment.creation_time[:10]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", creation_date):
+            return f"{creation_date}-{assignment.slug}"
+        return assignment.slug
+
+    def _assignment_detail_lines(self, assignment: Assignment) -> list[str]:
+        details: list[str] = []
+        creation_date = assignment.creation_time[:10]
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", creation_date):
+            details.append(f"* Created: {creation_date}")
+        if assignment.due_time:
+            details.append(f"* Due: {assignment.due_time}")
+        if assignment.max_points is not None:
+            details.append(f"* Points: {assignment.max_points:g}")
+        if assignment.topic:
+            details.append(f"* Topic: {assignment.topic}")
+        if assignment.rubric is not None:
+            details.append("* Rubric: ./rubric.csv")
+        return details
+
+
 class GoogleClassroomScraper(ClassroomScraper):
     """Live Google API-backed Classroom metadata scraper."""
 
@@ -240,8 +404,9 @@ class GoogleClassroomScraper(ClassroomScraper):
         return courses
 
     def fetch_assignments(self, course_id: str) -> list[Assignment]:
+        topic_cache = self._fetch_topic_cache(course_id)
         assignments = [
-            self._map_course_work(payload)
+            self._map_course_work(payload, topic_cache)
             for payload in self._paginate(
                 self.classroom_service.courses().courseWork().list,
                 "courseWork",
@@ -249,7 +414,7 @@ class GoogleClassroomScraper(ClassroomScraper):
             )
         ]
         assignments.extend(
-            self._map_course_work_material(payload)
+            self._map_course_work_material(payload, topic_cache)
             for payload in self._paginate(
                 self.classroom_service.courses().courseWorkMaterials().list,
                 "courseWorkMaterial",
@@ -257,6 +422,22 @@ class GoogleClassroomScraper(ClassroomScraper):
             )
         )
         return assignments
+
+    def _fetch_topic_cache(self, course_id: str) -> dict[str, str]:
+        try:
+            topics = self._paginate(
+                self.classroom_service.courses().topics().list,
+                "topics",
+                courseId=course_id,
+            )
+        except Exception:
+            # Topic access must not make otherwise readable coursework unarchivable.
+            return {}
+        return {
+            topic["topicId"]: topic["name"]
+            for topic in topics
+            if topic.get("topicId") and topic.get("name")
+        }
 
     def _load_cached_credentials(self, credentials_cls: Any, token_path: Path) -> Any:
         if not token_path.exists():
@@ -290,26 +471,119 @@ class GoogleClassroomScraper(ClassroomScraper):
             description=payload.get("description"),
         )
 
-    def _map_course_work(self, payload: dict[str, Any]) -> Assignment:
+    def _map_course_work(
+        self,
+        payload: dict[str, Any],
+        topic_cache: dict[str, str],
+    ) -> Assignment:
+        materials_payload = payload.get("materials", [])
+        work_type = payload.get("workType", "ASSIGNMENT")
+        title = payload.get("title", payload.get("id", "Untitled coursework"))
+        coursework_id = payload.get("id", "unknown")
+        if work_type not in SUPPORTED_WORK_TYPES:
+            raise RuntimeError(
+                f"Unsupported Classroom work type: [{work_type}] in assignment "
+                f"'{title}' ({coursework_id}). Halting execution."
+            )
+        if work_type == "ASSIGNMENT" and self._has_google_form(materials_payload):
+            work_type = "QUIZ_ASSIGNMENT"
         return Assignment(
-            title=payload.get("title", payload.get("id", "Untitled coursework")),
+            title=title,
             description=payload.get("description"),
-            materials=self._map_materials(payload.get("materials", [])),
+            materials=self._map_materials(materials_payload, title),
+            creation_time=payload.get("creationTime", ""),
+            max_points=self._map_max_points(payload.get("maxPoints")),
+            due_time=self._map_due_time(payload),
+            work_type=work_type,
+            topic=self._resolve_topic(payload.get("topicId"), topic_cache),
+            rubric=payload.get("rubric"),
         )
 
-    def _map_course_work_material(self, payload: dict[str, Any]) -> Assignment:
+    def _map_course_work_material(
+        self,
+        payload: dict[str, Any],
+        topic_cache: dict[str, str],
+    ) -> Assignment:
+        title = payload.get("title", payload.get("id", "Untitled material"))
         return Assignment(
-            title=payload.get("title", payload.get("id", "Untitled material")),
+            title=title,
             description=payload.get("description"),
-            materials=self._map_materials(payload.get("materials", [])),
+            materials=self._map_materials(payload.get("materials", []), title),
+            creation_time=payload.get("creationTime", ""),
+            topic=self._resolve_topic(payload.get("topicId"), topic_cache),
+            work_type="MATERIAL",
         )
 
-    def _map_materials(self, materials: list[dict[str, Any]]) -> list[ClassroomResource]:
-        return [resource for material in materials for resource in self._map_material(material)]
+    def _has_google_form(self, materials: list[dict[str, Any]]) -> bool:
+        for material in materials:
+            if "form" in material:
+                return True
+            link_url = material.get("link", {}).get("url", "")
+            if urlparse(link_url).hostname == "forms.google.com":
+                return True
+        return False
 
-    def _map_material(self, material: dict[str, Any]) -> list[ClassroomResource]:
+    def _resolve_topic(
+        self,
+        topic_id: Any,
+        topic_cache: dict[str, str],
+    ) -> str | None:
+        if not isinstance(topic_id, str) or not topic_id:
+            return None
+        return topic_cache.get(topic_id, topic_id)
+
+    def _map_max_points(self, value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _map_due_time(self, payload: dict[str, Any]) -> str | None:
+        due_date = payload.get("dueDate")
+        due_time = payload.get("dueTime")
+        if not due_date or not due_time:
+            return None
+        try:
+            year = int(due_date["year"])
+            month = int(due_date["month"])
+            day = int(due_date["day"])
+            hours = int(due_time.get("hours", 0))
+            minutes = int(due_time.get("minutes", 0))
+        except (KeyError, TypeError, ValueError):
+            return None
+        # Zero padding preserves lexical sorting and matches the corpus metadata contract.
+        return f"{year:04d}-{month:02d}-{day:02d} {hours:02d}:{minutes:02d}"
+
+    def _map_materials(
+        self,
+        materials: list[Any],
+        assignment_title: str,
+    ) -> list[ClassroomResource]:
+        return [
+            resource
+            for material in materials
+            for resource in self._map_material(material, assignment_title)
+        ]
+
+    def _map_material(
+        self,
+        material: Any,
+        assignment_title: str,
+    ) -> list[ClassroomResource]:
+        if not isinstance(material, dict):
+            raise RuntimeError(
+                "Unsupported material attachment type: [unknown] in assignment "
+                f"'{assignment_title}'. Halting execution."
+            )
         if "driveFile" in material:
-            return [self._map_drive_file(material["driveFile"].get("driveFile", {}))]
+            return [
+                self._map_drive_file(
+                    material["driveFile"].get("driveFile", {}),
+                    assignment_title,
+                )
+            ]
         if "link" in material:
             link = material["link"]
             return [
@@ -337,27 +611,61 @@ class GoogleClassroomScraper(ClassroomScraper):
                     source_url=form.get("formUrl", ""),
                 )
             ]
-        return []
+        source_type = next(iter(material), "unknown")
+        raise RuntimeError(
+            f"Unsupported material attachment type: [{source_type}] in assignment "
+            f"'{assignment_title}'. Halting execution."
+        )
 
-    def _map_drive_file(self, drive_file: dict[str, Any]) -> ClassroomResource:
-        metadata = self._fetch_drive_file_metadata(drive_file.get("id"))
+    def _map_drive_file(
+        self,
+        drive_file: dict[str, Any],
+        assignment_title: str,
+    ) -> ClassroomResource:
+        file_id = drive_file.get("id")
+        metadata = self._fetch_drive_file_metadata(file_id, assignment_title)
         title = metadata.get("name") or drive_file.get("title") or drive_file.get("id", "")
         source_url = metadata.get("webViewLink") or drive_file.get("alternateLink", "")
+        mime_type = metadata.get("mimeType")
+        if mime_type not in SUPPORTED_MIME_TYPES:
+            raise RuntimeError(
+                f"Unsupported Drive file MIME type: [{mime_type}] for file '{title}' "
+                f"in assignment '{assignment_title}'. Halting execution."
+            )
         return ClassroomResource(
             title=title,
             source_type="driveFile",
             source_url=source_url,
-            mime_type=metadata.get("mimeType"),
+            mime_type=mime_type,
         )
 
-    def _fetch_drive_file_metadata(self, file_id: str | None) -> dict[str, Any]:
+    def _fetch_drive_file_metadata(
+        self,
+        file_id: str | None,
+        assignment_title: str,
+    ) -> dict[str, Any]:
         if not file_id or not self.drive_service:
             return {}
-        return (
-            self.drive_service.files()
-            .get(fileId=file_id, fields="id,name,mimeType,webViewLink")
-            .execute()
-        )
+        try:
+            return (
+                self.drive_service.files()
+                .get(fileId=file_id, fields="id,name,mimeType,webViewLink")
+                .execute()
+            )
+        except Exception as exc:
+            # Translate only known HTTP failures; unexpected API failures retain their details.
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 404:
+                raise RuntimeError(
+                    f"Drive file or attachment not found: [{file_id}] in assignment "
+                    f"'{assignment_title}'. Halting execution."
+                ) from exc
+            if status == 403:
+                raise RuntimeError(
+                    f"Permission denied for Drive file [{file_id}] in assignment "
+                    f"'{assignment_title}'. Check OAuth scopes. Halting execution."
+                ) from exc
+            raise
 
 
 # --- Main Orchestration Execution ---
@@ -369,6 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
             "    python3 bin/classroom-archiver.py --creds secrets/credentials.json",
             "    python3 bin/classroom-archiver.py --creds secrets/credentials.json --list-classrooms",
             "    python3 bin/classroom-archiver.py --creds secrets/credentials.json --course full-stack-webdev",
+            "    python3 bin/classroom-archiver.py --creds secrets/credentials.json --archive-classroom 1234567890-apcsa-2025-2026",
         ]
     )
     parser = argparse.ArgumentParser(
@@ -390,9 +699,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output",
-        default=DEFAULT_CORPUS_ROOT,
+        default=None,
         type=Path,
-        help=f"Target output root directory (default: {DEFAULT_CORPUS_ROOT}).",
+        help="Legacy alias for the target corpus root directory.",
+    )
+    parser.add_argument(
+        "--corpus-dir",
+        type=Path,
+        default=None,
+        help="Path to an external educational corpus root directory.",
     )
     parser.add_argument(
         "--course",
@@ -408,7 +723,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--list-classrooms",
         action="store_true",
-        help="Print available course names and slug tokens, then exit without writing.",
+        help="Print available archive tokens, then exit without writing.",
+    )
+    parser.add_argument(
+        "--archive-classroom",
+        default=None,
+        metavar="ARCHIVE_TOKEN",
+        help="Archive one classroom by archive token (e.g. 1234567890-apcsa-2025-2026).",
     )
     return parser
 
@@ -420,7 +741,38 @@ def list_classrooms(
 ) -> None:
     scraper.authenticate(creds_path)
     for course in scraper.fetch_courses(teacher_email=teacher_email):
-        print(f"{course.name}\t{course.slug}")
+        print(f"{course.id}-{course.slug}")
+
+
+def write_course_archive(writer: CorpusWriter, course: Course) -> None:
+    """Write one validated course through the writer's strongest available boundary."""
+    if isinstance(writer, MarkdownCorpusWriter):
+        writer.write_course(course)
+        return
+    writer.write_course_structure(course)
+    for assignment in course.assignments:
+        writer.write_assignment_structure(course, assignment)
+
+
+def archive_classroom(
+    scraper: ClassroomScraper,
+    writer: CorpusWriter,
+    creds_path: Path,
+    archive_token: str,
+    teacher_email: str | None = None,
+) -> None:
+    classroom_id = parse_archive_token(archive_token)
+    scraper.authenticate(creds_path)
+    courses = scraper.fetch_courses(teacher_email=teacher_email)
+    course = next((c for c in courses if c.id == classroom_id), None)
+    if course is None:
+        raise RuntimeError(f"Classroom ID not found: {classroom_id}")
+    course_dir = writer.target_root / "courses" / course.slug
+    # Refuse an existing course before fetching or writing so archives stay immutable.
+    if course_dir.exists():
+        raise RuntimeError("course directory already exists")
+    course.assignments = scraper.fetch_assignments(course.id)
+    write_course_archive(writer, course)
 
 
 def archive_courses(
@@ -435,9 +787,7 @@ def archive_courses(
         if course_filter != "all" and course_filter not in {course.id, course.slug}:
             continue
         course.assignments = scraper.fetch_assignments(course.id)
-        writer.write_course_structure(course)
-        for assignment in course.assignments:
-            writer.write_assignment_structure(course, assignment)
+        write_course_archive(writer, course)
 
 
 def main(
@@ -451,11 +801,35 @@ def main(
     active_scraper = scraper or GoogleClassroomScraper()
 
     try:
+        if args.corpus_dir is not None:
+            if not args.corpus_dir.is_dir():
+                raise RuntimeError("corpus directory does not exist")
+            active_corpus_root = args.corpus_dir
+        elif args.output is not None:
+            active_corpus_root = args.output
+        else:
+            active_corpus_root = Path.cwd() / "corpus"
+
         if args.list_classrooms:
             list_classrooms(active_scraper, args.creds, args.teacher_email)
             return 0
 
-        active_writer = writer or SkeletonCorpusWriter(args.output)
+        if writer is None and args.corpus_dir is None and args.output is None:
+            # Only the implicit local corpus is safe to create on the user's behalf.
+            active_corpus_root.mkdir(parents=True, exist_ok=True)
+
+        active_writer = writer or MarkdownCorpusWriter(active_corpus_root)
+
+        if args.archive_classroom:
+            archive_classroom(
+                active_scraper,
+                active_writer,
+                args.creds,
+                args.archive_classroom,
+                args.teacher_email,
+            )
+            return 0
+
         archive_courses(
             active_scraper,
             active_writer,

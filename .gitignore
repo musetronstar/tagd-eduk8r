@@ -4,3 +4,6 @@ __*
 # hidden files/dirs
 .*
 !.gitignore
+
+# archived corpus
+corpus/

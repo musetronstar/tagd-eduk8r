@@ -1,1 +1,0 @@
-logSequence('async-defer');

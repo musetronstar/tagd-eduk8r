@@ -101,7 +101,7 @@ corpus/
 └── courses/
     └── intro-to-python/
         └── assignments/
-            └── personal-data/
+            └── 2026-07-20-personal-data/
                 └── index.md
 ```
 
@@ -125,7 +125,7 @@ A directory may optionally contain `meta.tagl`, whose semantic extensions or ove
 
 ---
 
-## Generator
+# Generator
 
 A generator traverses the corpus and produces TAGL UTF-8 text describing the educational assets discovered within it.
 
@@ -138,53 +138,42 @@ The generated tagspace is the TAGL **map** of the corpus **territory**.
 The following statements are always true.
 
 1. The corpus is the authoritative representation of educational content.
-
 2. Every file or directory within the corpus is a file asset.
-
 3. A directory containing `index.md` is an educational asset.
-
 4. Assets may recursively contain subordinate assets.
-
 5. Asset identity is determined by containment within the corpus hierarchy.
-
 6. `index.md` provides the canonical human-readable representation of an asset.
-
 7. `meta.tagl` provide optional semantic extensions or overrides.
-
 8. The generated tagspace preserves the containment hierarchy of the corpus.
 
 ---
 
-# Corpus Organization Example
+# Complete Assignment Asset Structure
+
+Teacher-authored coursework assets imported from Google Classroom are serialized into deterministic local asset folders. Student submissions, student grades, and student PII are explicitly excluded.
 
 ```text
-corpus/
-├── courses/
-│   ├── index.md
-│   └── intro-to-python/
-│       ├── index.md
-│       └── assignments/
-│           └── personal-data/
-│               └── index.md
-├── tutorials/
-│   ├── index.md
-│   └── hellow-world/
-│       ├── index.md
-│       ├── meta.tagl
-│       └── files/
-│           ├── hello.py
-│           └── slides.pdf
-└── resources/
-    ├── index.md
-    └── python-input-output/
-        └── index.md
+corpus/courses/{course-slug}/assignments/{YYYY-MM-DD}-{assignment-slug}/
+├── index.md                      # Title, description, points, due date, topics
+├── rubric.csv                    # Tabular rubric criteria/levels (if present)
+├── attachments/                  # Downloaded assignment materials and resources
+│   ├── {Sanitized-Title}.pdf     # Binary attachments or exported Google Slides
+│   ├── {Sanitized-Title}.csv     # Exported Google Sheets
+│   ├── {Sanitized-Title}.docx    # Exported Google Doc binary format
+│   ├── {Sanitized-Title}.md      # Exported Google Doc Markdown representation
+│   └── {Sanitized-Title}_files/  # Media assets extracted from exported Google Docs
+├── {form-slug}-questions.md     # Serialized quiz questions (for QUIZ_ASSIGNMENT)
+├── {form-slug}-answers.md       # Serialized quiz answer keys
+└── form-files/                   # Embedded media extracted from Google Forms
 ```
 
-The names of directories are significant because they contribute to the identity of the generated semantic entities.
+### Attachment Filename Sanitization Rules
 
-Notice, for example, that the assignment "Personal Data" in the course "Introduction to Python" can have
-**horizontal relations** to tutorials and resources, but not exclusively, as these same tutorials and resources
-could also be used in other courses, or assignments.  Corpus assets are composable building blocks.
+When writing files into `attachments/`:
+
+1. Use exact human-readable asset/file titles.
+2. Replace OS-unsafe and path-traversal characters (`/`, `\`, `:`, `?`, `*`, `<`, `>`, `|`, `"`) with hyphens (`-`).
+3. Strip leading and trailing whitespace and leading hyphens/spaces so files never begin with unsafe characters.
 
 ---
 
