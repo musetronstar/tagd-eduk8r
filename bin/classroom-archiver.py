@@ -11,11 +11,15 @@ Usage:
 """
 
 import argparse
+import io
 import json
 import os
 import re
 import shutil
+import sys
 import tempfile
+import time
+import zipfile
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +31,8 @@ from urllib.parse import urlparse
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 DEFAULT_CORPUS_ROOT = REPO_ROOT / "corpus"
+# Leave headroom below restrictive filesystem component limits such as 143 bytes.
+MAX_ASSIGNMENT_DIRECTORY_NAME_LENGTH = 120
 GOOGLE_API_SCOPES = [
     "https://www.googleapis.com/auth/classroom.courses.readonly",
     "https://www.googleapis.com/auth/classroom.coursework.students.readonly",
@@ -53,22 +59,31 @@ SUPPORTED_FORM_ITEM_TYPES = frozenset(
         "MULTIPLE_CHOICE_GRID",
     }
 )
-SUPPORTED_MIME_TYPES = frozenset(
+SUPPORTED_WORKSPACE_MIME_TYPES = frozenset(
     {
         "application/vnd.google-apps.document",
         "application/vnd.google-apps.spreadsheet",
         "application/vnd.google-apps.presentation",
-        "application/pdf",
-        "application/zip",
-        "application/x-zip-compressed",
-        "image/png",
-        "image/jpeg",
-        "image/gif",
-        "image/svg+xml",
-        "text/plain",
-        "text/csv",
     }
 )
+GOOGLE_WORKSPACE_MIME_PREFIX = "application/vnd.google-apps."
+WORKSPACE_EXPORTS = {
+    "application/vnd.google-apps.document": (
+        (".md", "text/html"),
+        (
+            ".docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        ),
+    ),
+    "application/vnd.google-apps.spreadsheet": ((".csv", "text/csv"),),
+    "application/vnd.google-apps.presentation": (
+        (
+            ".pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+        (".pdf", "application/pdf"),
+    ),
+}
 
 
 # --- Data Models ---
@@ -82,6 +97,11 @@ def slugify(value: str) -> str:
 def parse_archive_token(token: str) -> str:
     """Extract the Classroom ID from an archive token or bare ID."""
     return token.split("-", 1)[0]
+
+
+def format_archive_token(course: "Course") -> str:
+    """Return the canonical token used to identify a discovered classroom."""
+    return f"{course.id}-{course.slug}"
 
 
 def sanitize_filename(name: str) -> str:
@@ -104,6 +124,26 @@ def validate_form_item_type(item_type: str, form_id: str) -> None:
         )
 
 
+class MissingDriveAttachmentError(RuntimeError):
+    """Signal a recoverable missing Drive payload across the download boundary."""
+
+    def __init__(self, file_id: str) -> None:
+        super().__init__(file_id)
+        self.file_id = file_id
+
+
+class DriveExportSizeLimitError(RuntimeError):
+    """Signal a recoverable Workspace export limit across the download boundary."""
+
+    def __init__(self, file_id: str) -> None:
+        super().__init__(file_id)
+        self.file_id = file_id
+
+
+class UnsupportedDriveMimeError(RuntimeError):
+    """Mark an already-reported MIME failure that must halt the archive."""
+
+
 @dataclass
 class ClassroomResource:
     """A Classroom resource, material, attachment, or linked asset."""
@@ -113,6 +153,7 @@ class ClassroomResource:
     source_url: str
     mime_type: str | None = None
     local_filename: str | None = None
+    file_id: str | None = None
 
 
 @dataclass
@@ -237,6 +278,10 @@ class SkeletonCorpusWriter(CorpusWriter):
 class MarkdownCorpusWriter(CorpusWriter):
     """Writes classroom content as clean Markdown under corpus/courses/."""
 
+    def __init__(self, target_root: Path = DEFAULT_CORPUS_ROOT, downloader: Any = None) -> None:
+        super().__init__(target_root)
+        self.downloader = downloader
+
     def write_course(self, course: Course) -> None:
         destination = self.target_root / "courses" / course.slug
         if destination.exists():
@@ -244,7 +289,7 @@ class MarkdownCorpusWriter(CorpusWriter):
 
         # Staging keeps an interrupted course from becoming part of the corpus.
         with tempfile.TemporaryDirectory(prefix=f"tagd-archive-{course.id}-") as temp_dir:
-            staging_writer = MarkdownCorpusWriter(Path(temp_dir))
+            staging_writer = MarkdownCorpusWriter(Path(temp_dir), self.downloader)
             staging_writer.write_course_structure(course)
             for assignment in course.assignments:
                 staging_writer.write_assignment_structure(course, assignment)
@@ -263,6 +308,7 @@ class MarkdownCorpusWriter(CorpusWriter):
         (course_dir / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     def write_assignment_structure(self, course: Course, assignment: Assignment) -> None:
+        print(f"* Assignment: '{assignment.title}'")
         assignment_dir_name = self._assignment_dir_name(assignment)
         try:
             type_subdirectory = ENTRY_TYPE_DIRECTORIES[assignment.work_type]
@@ -300,17 +346,124 @@ class MarkdownCorpusWriter(CorpusWriter):
         if file_materials:
             lines.extend(["", "## Materials", ""])
             for material in file_materials:
-                lines.append(f"* [{material.title}]({material.source_url})")
+                lines.append(
+                    self._write_material(
+                        assignment_dir,
+                        material,
+                    )
+                )
         detail_lines = self._assignment_detail_lines(assignment)
         if detail_lines:
             lines.extend(["", "## Assignment Details", *detail_lines])
         (assignment_dir / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
+    def _write_material(
+        self,
+        assignment_dir: Path,
+        material: ClassroomResource,
+    ) -> str:
+        if material.source_type == "missingDriveFile":
+            return self._missing_attachment_stub(material)
+        if material.source_type == "unsupportedDriveFile":
+            print(
+                f"Error: Unsupported Drive MIME type '{material.mime_type}' "
+                f"for attachment '{material.title}'.",
+                file=sys.stderr,
+            )
+            raise UnsupportedDriveMimeError(
+                f"Unsupported Drive MIME type '{material.mime_type}' "
+                f"for attachment '{material.title}'."
+            )
+        if material.source_type != "driveFile" or not self.downloader or not material.file_id:
+            return f"* [{material.title}]({material.source_url})"
+
+        attachments_dir = assignment_dir / "attachments"
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+        local_paths = self._attachment_paths(material, attachments_dir)
+        try:
+            for local_path in local_paths:
+                self.downloader(material.file_id, local_path)
+        except MissingDriveAttachmentError:
+            self._remove_incomplete_attachment_paths(local_paths)
+            if attachments_dir.exists() and not any(attachments_dir.iterdir()):
+                attachments_dir.rmdir()
+            return self._missing_attachment_stub(material)
+        except DriveExportSizeLimitError:
+            self._remove_incomplete_attachment_paths(local_paths)
+            if attachments_dir.exists() and not any(attachments_dir.iterdir()):
+                attachments_dir.rmdir()
+            return self._export_size_limit_stub(material)
+        return self._local_material_link(material, local_paths)
+
+    def _missing_attachment_stub(
+        self,
+        material: ClassroomResource,
+    ) -> str:
+        print(
+            f"Warning: Attachment '{material.file_id}' ('{material.title}') not found "
+            "or inaccessible. Skipping attachment download.",
+            file=sys.stderr,
+        )
+        return (
+            f"* [Attachment Missing: {material.title} "
+            "(File not found or inaccessible on Google Drive)]"
+        )
+
+    def _export_size_limit_stub(self, material: ClassroomResource) -> str:
+        print(
+            f"Warning: Attachment '{material.title}' (ID: '{material.file_id}') "
+            "exceeds Google Drive API export size limits. Skipping attachment download.",
+            file=sys.stderr,
+        )
+        return (
+            f"* [Attachment Unavailable: {material.title} "
+            "(Exceeds Google Drive API export size limits)]"
+        )
+
+    def _remove_incomplete_attachment_paths(self, local_paths: list[Path]) -> None:
+        for local_path in local_paths:
+            local_path.unlink(missing_ok=True)
+            sidecar_dir = local_path.parent / f"{local_path.name}-files"
+            if sidecar_dir.exists():
+                shutil.rmtree(sidecar_dir)
+
+    def _attachment_paths(
+        self,
+        material: ClassroomResource,
+        attachments_dir: Path,
+    ) -> list[Path]:
+        filename = sanitize_filename(material.title)
+        exports = WORKSPACE_EXPORTS.get(material.mime_type)
+        if exports:
+            return [attachments_dir / f"{filename}{suffix}" for suffix, _ in exports]
+        return [attachments_dir / filename]
+
+    def _local_material_link(
+        self,
+        material: ClassroomResource,
+        local_paths: list[Path],
+    ) -> str:
+        relative_paths = [f"attachments/{path.name}" for path in local_paths]
+        if material.mime_type == "application/vnd.google-apps.document":
+            return (
+                f"* [{material.title}]({relative_paths[0]}) "
+                f"([DOCX]({relative_paths[1]}))"
+            )
+        if material.mime_type == "application/vnd.google-apps.presentation":
+            return (
+                f"* [{material.title}]({relative_paths[0]}) "
+                f"([PDF]({relative_paths[1]}))"
+            )
+        return f"* [{material.title}]({relative_paths[0]})"
+
     def _assignment_dir_name(self, assignment: Assignment) -> str:
         creation_date = assignment.creation_time[:10]
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", creation_date):
-            return f"{creation_date}-{assignment.slug}"
-        return assignment.slug
+            prefix = f"{creation_date}-"
+            return prefix + assignment.slug[
+                : MAX_ASSIGNMENT_DIRECTORY_NAME_LENGTH - len(prefix)
+            ]
+        return assignment.slug[:MAX_ASSIGNMENT_DIRECTORY_NAME_LENGTH]
 
     def _assignment_detail_lines(self, assignment: Assignment) -> list[str]:
         details: list[str] = []
@@ -335,6 +488,7 @@ class GoogleClassroomScraper(ClassroomScraper):
         self.classroom_service: Any = None
         self.drive_service: Any = None
         self.token_path: Path | None = None
+        self.drive_metadata: dict[str, dict[str, Any]] = {}
 
     def authenticate(self, creds_path: Path) -> None:
         self._validate_client_credentials_file(creds_path)
@@ -390,38 +544,50 @@ class GoogleClassroomScraper(ClassroomScraper):
             )
 
     def fetch_courses(self, teacher_email: str | None = None) -> list[Course]:
-        courses: list[Course] = []
-        for state in ("ACTIVE", "ARCHIVED"):
-            course_filters: dict[str, Any] = {"courseStates": [state]}
-            if teacher_email:
-                course_filters["teacherId"] = teacher_email
+        course_filters: dict[str, Any] = {
+            "courseStates": ["ACTIVE", "ARCHIVED"],
+        }
+        if teacher_email:
+            course_filters["teacherId"] = teacher_email
+        return [
+            self._map_course(payload)
             for payload in self._paginate(
                 self.classroom_service.courses().list,
                 "courses",
                 **course_filters,
-            ):
-                courses.append(self._map_course(payload))
-        return courses
-
-    def fetch_assignments(self, course_id: str) -> list[Assignment]:
-        topic_cache = self._fetch_topic_cache(course_id)
-        assignments = [
-            self._map_course_work(payload, topic_cache)
-            for payload in self._paginate(
-                self.classroom_service.courses().courseWork().list,
-                "courseWork",
-                courseId=course_id,
             )
         ]
-        assignments.extend(
-            self._map_course_work_material(payload, topic_cache)
-            for payload in self._paginate(
-                self.classroom_service.courses().courseWorkMaterials().list,
-                "courseWorkMaterial",
-                courseId=course_id,
+
+    def fetch_assignments(self, course_id: str) -> list[Assignment]:
+        try:
+            topic_cache = self._fetch_topic_cache(course_id)
+            assignments = [
+                self._map_course_work(payload, topic_cache)
+                for payload in self._paginate(
+                    self.classroom_service.courses().courseWork().list,
+                    "courseWork",
+                    courseId=course_id,
+                )
+            ]
+            assignments.extend(
+                self._map_course_work_material(payload, topic_cache)
+                for payload in self._paginate(
+                    self.classroom_service.courses().courseWorkMaterials().list,
+                    "courseWorkMaterial",
+                    courseId=course_id,
+                )
             )
-        )
-        return assignments
+            return assignments
+        except Exception as exc:
+            # Course context turns an opaque API denial into actionable archive guidance.
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 403:
+                raise RuntimeError(
+                    f"Permission denied accessing coursework for course '{course_id}'. "
+                    "Ensure the authenticated account is an owner/teacher of this course "
+                    "(active or archived). Halting execution."
+                ) from exc
+            raise
 
     def _fetch_topic_cache(self, course_id: str) -> dict[str, str]:
         try:
@@ -458,7 +624,22 @@ class GoogleClassroomScraper(ClassroomScraper):
             request_kwargs = dict(kwargs)
             if page_token:
                 request_kwargs["pageToken"] = page_token
-            response = list_method(**request_kwargs).execute()
+            for attempt in range(3):
+                try:
+                    response = list_method(**request_kwargs).execute()
+                    break
+                except Exception as exc:
+                    status = getattr(getattr(exc, "resp", None), "status", None)
+                    if status not in {500, 502, 503, 504}:
+                        raise
+                    if attempt == 2:
+                        course_id = request_kwargs.get("courseId", "unknown")
+                        raise RuntimeError(
+                            f"Google API transient error ({status}) on course "
+                            f"'{course_id}'. Halting execution."
+                        ) from exc
+                    # Bounded backoff handles brief Google API faults without hiding failures.
+                    time.sleep(2 ** attempt)
             items.extend(response.get(response_key, []))
             page_token = response.get("nextPageToken")
             if not page_token:
@@ -530,7 +711,7 @@ class GoogleClassroomScraper(ClassroomScraper):
     ) -> str | None:
         if not isinstance(topic_id, str) or not topic_id:
             return None
-        return topic_cache.get(topic_id, topic_id)
+        return topic_cache.get(topic_id)
 
     def _map_max_points(self, value: Any) -> float | None:
         if value is None:
@@ -623,20 +804,31 @@ class GoogleClassroomScraper(ClassroomScraper):
         assignment_title: str,
     ) -> ClassroomResource:
         file_id = drive_file.get("id")
-        metadata = self._fetch_drive_file_metadata(file_id, assignment_title)
+        try:
+            metadata = self._fetch_drive_file_metadata(file_id, assignment_title)
+        except MissingDriveAttachmentError:
+            return ClassroomResource(
+                title=drive_file.get("title") or file_id or "Unknown attachment",
+                source_type="missingDriveFile",
+                source_url="",
+                file_id=file_id,
+            )
         title = metadata.get("name") or drive_file.get("title") or drive_file.get("id", "")
         source_url = metadata.get("webViewLink") or drive_file.get("alternateLink", "")
         mime_type = metadata.get("mimeType")
-        if mime_type not in SUPPORTED_MIME_TYPES:
-            raise RuntimeError(
-                f"Unsupported Drive file MIME type: [{mime_type}] for file '{title}' "
-                f"in assignment '{assignment_title}'. Halting execution."
-            )
+        # Uploaded blobs are intrinsically downloadable; only Workspace apps need
+        # an explicit export contract to prevent lossy or impossible archives.
+        is_supported = bool(mime_type) and (
+            mime_type in SUPPORTED_WORKSPACE_MIME_TYPES
+            or not mime_type.startswith(GOOGLE_WORKSPACE_MIME_PREFIX)
+        )
+        source_type = "driveFile" if is_supported else "unsupportedDriveFile"
         return ClassroomResource(
             title=title,
-            source_type="driveFile",
+            source_type=source_type,
             source_url=source_url,
             mime_type=mime_type,
+            file_id=file_id,
         )
 
     def _fetch_drive_file_metadata(
@@ -647,25 +839,153 @@ class GoogleClassroomScraper(ClassroomScraper):
         if not file_id or not self.drive_service:
             return {}
         try:
-            return (
+            metadata = (
                 self.drive_service.files()
                 .get(fileId=file_id, fields="id,name,mimeType,webViewLink")
                 .execute()
             )
+            self.drive_metadata[file_id] = metadata
+            return metadata
         except Exception as exc:
             # Translate only known HTTP failures; unexpected API failures retain their details.
             status = getattr(getattr(exc, "resp", None), "status", None)
             if status == 404:
-                raise RuntimeError(
-                    f"Drive file or attachment not found: [{file_id}] in assignment "
-                    f"'{assignment_title}'. Halting execution."
-                ) from exc
+                raise MissingDriveAttachmentError(file_id) from exc
             if status == 403:
                 raise RuntimeError(
                     f"Permission denied for Drive file [{file_id}] in assignment "
                     f"'{assignment_title}'. Check OAuth scopes. Halting execution."
                 ) from exc
             raise
+
+    def download_drive_file(self, file_id: str, destination_path: Path) -> None:
+        """Stream one mapped Drive attachment or export directly into staging."""
+        try:
+            metadata = self.drive_metadata.get(file_id)
+            if metadata is None:
+                metadata = (
+                    self.drive_service.files()
+                    .get(fileId=file_id, fields="id,name,mimeType,webViewLink")
+                    .execute()
+                )
+                self.drive_metadata[file_id] = metadata
+            mime_type = metadata.get("mimeType")
+            if (
+                mime_type == "application/vnd.google-apps.document"
+                and destination_path.suffix == ".md"
+            ):
+                self._export_google_doc_markdown(file_id, destination_path)
+                return
+            export_mime_type = self._export_mime_type(
+                mime_type,
+                destination_path.suffix,
+            )
+            if export_mime_type:
+                request = self.drive_service.files().export_media(
+                    fileId=file_id,
+                    mimeType=export_mime_type,
+                )
+            else:
+                request = self.drive_service.files().get_media(fileId=file_id)
+            self._stream_drive_request(request, destination_path)
+        except Exception as exc:
+            status = getattr(getattr(exc, "resp", None), "status", None)
+            if status == 404:
+                raise MissingDriveAttachmentError(file_id) from exc
+            if self._is_export_size_limit_error(exc):
+                raise DriveExportSizeLimitError(file_id) from exc
+            raise
+
+    def _is_export_size_limit_error(self, exc: Exception) -> bool:
+        status = getattr(getattr(exc, "resp", None), "status", None)
+        if status != 403:
+            return False
+        # Drive has represented this condition in both structured reasons and text.
+        error_text = " ".join(
+            (
+                str(exc),
+                repr(getattr(exc, "content", "")),
+                repr(getattr(exc, "error_details", "")),
+            )
+        )
+        return (
+            "exportSizeLimitExceeded" in error_text
+            or "This file is too large to be exported." in error_text
+        )
+
+    def _export_mime_type(self, mime_type: Any, suffix: str) -> str | None:
+        for export_suffix, export_mime_type in WORKSPACE_EXPORTS.get(mime_type, ()):
+            if export_suffix == suffix:
+                return export_mime_type
+        return None
+
+    def _stream_drive_request(self, request: Any, destination_path: Path) -> None:
+        try:
+            from googleapiclient.http import MediaIoBaseDownload
+        except ImportError as exc:
+            raise RuntimeError(
+                "Missing Google API dependency google-api-python-client."
+            ) from exc
+        destination_path.parent.mkdir(parents=True, exist_ok=True)
+        with destination_path.open("wb") as output_file:
+            downloader = MediaIoBaseDownload(output_file, request)
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+
+    def _export_google_doc_markdown(self, file_id: str, destination_path: Path) -> None:
+        try:
+            from markdownify import markdownify
+        except ImportError as exc:
+            raise RuntimeError(
+                "Missing Google Doc conversion dependency. Install markdownify."
+            ) from exc
+
+        with tempfile.TemporaryDirectory(prefix="tagd-google-doc-") as temp_dir:
+            export_path = Path(temp_dir) / "document-export"
+            request = self.drive_service.files().export_media(
+                fileId=file_id,
+                mimeType="text/html",
+            )
+            self._stream_drive_request(request, export_path)
+            response_bytes = export_path.read_bytes()
+            response_buffer = io.BytesIO(response_bytes)
+            if zipfile.is_zipfile(response_buffer):
+                response_buffer.seek(0)
+                with zipfile.ZipFile(response_buffer) as archive:
+                    html_names = [
+                        name
+                        for name in archive.namelist()
+                        if name.lower().endswith(".html")
+                    ]
+                    if not html_names:
+                        raise RuntimeError(
+                            f"Google Doc HTML export contained no HTML file: [{file_id}]. "
+                            "Halting execution."
+                        )
+                    html = archive.read(html_names[0]).decode("utf-8")
+                    sidecar_name = f"{destination_path.name}-files"
+                    sidecar_dir = destination_path.parent / sidecar_name
+                    for member in archive.namelist():
+                        if member.endswith("/") or not member.startswith("images/"):
+                            continue
+                        relative_media_path = Path(member).relative_to("images")
+                        if any(part == ".." for part in relative_media_path.parts):
+                            raise RuntimeError(
+                                f"Unsafe media path in Google Doc export: [{member}]. "
+                                "Halting execution."
+                            )
+                        media_path = sidecar_dir / relative_media_path
+                        media_path.parent.mkdir(parents=True, exist_ok=True)
+                        media_path.write_bytes(archive.read(member))
+                        html = html.replace(
+                            member,
+                            f"{sidecar_name}/{relative_media_path.as_posix()}",
+                        )
+            else:
+                # Text-only Docs may return HTML directly instead of a ZIP container.
+                html = response_bytes.decode("utf-8")
+            destination_path.write_text(markdownify(html), encoding="utf-8")
 
 
 # --- Main Orchestration Execution ---
@@ -678,6 +998,7 @@ def build_parser() -> argparse.ArgumentParser:
             "    python3 bin/classroom-archiver.py --creds secrets/credentials.json --list-classrooms",
             "    python3 bin/classroom-archiver.py --creds secrets/credentials.json --course full-stack-webdev",
             "    python3 bin/classroom-archiver.py --creds secrets/credentials.json --archive-classroom 1234567890-apcsa-2025-2026",
+            "    python3 bin/classroom-archiver.py --creds secrets/credentials.json --archive-classrooms-file docs/classrooms-list.txt",
         ]
     )
     parser = argparse.ArgumentParser(
@@ -731,6 +1052,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="ARCHIVE_TOKEN",
         help="Archive one classroom by archive token (e.g. 1234567890-apcsa-2025-2026).",
     )
+    parser.add_argument(
+        "--archive-classrooms-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Archive classroom tokens listed in a text file, skipping existing courses.",
+    )
     return parser
 
 
@@ -741,7 +1069,7 @@ def list_classrooms(
 ) -> None:
     scraper.authenticate(creds_path)
     for course in scraper.fetch_courses(teacher_email=teacher_email):
-        print(f"{course.id}-{course.slug}")
+        print(format_archive_token(course))
 
 
 def write_course_archive(writer: CorpusWriter, course: Course) -> None:
@@ -773,6 +1101,51 @@ def archive_classroom(
         raise RuntimeError("course directory already exists")
     course.assignments = scraper.fetch_assignments(course.id)
     write_course_archive(writer, course)
+
+
+def read_archive_tokens(token_file: Path) -> list[str]:
+    """Read actionable archive tokens while preserving their file order."""
+    try:
+        lines = token_file.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise RuntimeError(f"Unable to read classroom token file: {token_file}") from exc
+    return [
+        stripped
+        for line in lines
+        if (stripped := line.strip()) and not stripped.startswith("#")
+    ]
+
+
+def archive_classrooms_file(
+    scraper: ClassroomScraper,
+    writer: CorpusWriter,
+    creds_path: Path,
+    token_file: Path,
+    teacher_email: str | None = None,
+) -> None:
+    """Archive listed classrooms sequentially, resuming past completed courses."""
+    scraper.authenticate(creds_path)
+    courses_by_id = {
+        course.id: course
+        for course in scraper.fetch_courses(teacher_email=teacher_email)
+    }
+    archived_count = 0
+    for archive_token in read_archive_tokens(token_file):
+        classroom_id = parse_archive_token(archive_token)
+        course = courses_by_id.get(classroom_id)
+        if course is None:
+            raise RuntimeError(f"Classroom ID not found: {classroom_id}")
+        canonical_token = format_archive_token(course)
+        course_dir = writer.target_root / "courses" / course.slug
+        if course_dir.exists():
+            # Existing directories are completed checkpoints for resumable batch runs.
+            print(f"Skipping '{canonical_token}', already exists")
+            continue
+        print(f"Archiving '{canonical_token}' ...")
+        course.assignments = scraper.fetch_assignments(course.id)
+        write_course_archive(writer, course)
+        archived_count += 1
+    print(f"{archived_count} courses archived")
 
 
 def archive_courses(
@@ -818,7 +1191,20 @@ def main(
             # Only the implicit local corpus is safe to create on the user's behalf.
             active_corpus_root.mkdir(parents=True, exist_ok=True)
 
-        active_writer = writer or MarkdownCorpusWriter(active_corpus_root)
+        active_writer = writer or MarkdownCorpusWriter(
+            active_corpus_root,
+            getattr(active_scraper, "download_drive_file", None),
+        )
+
+        if args.archive_classrooms_file:
+            archive_classrooms_file(
+                active_scraper,
+                active_writer,
+                args.creds,
+                args.archive_classrooms_file,
+                args.teacher_email,
+            )
+            return 0
 
         if args.archive_classroom:
             archive_classroom(
@@ -837,6 +1223,8 @@ def main(
             args.course,
             args.teacher_email,
         )
+    except UnsupportedDriveMimeError:
+        raise SystemExit(1)
     except RuntimeError as exc:
         parser.exit(1, f"classroom-archiver.py: error: {exc}\n")
     return 0
